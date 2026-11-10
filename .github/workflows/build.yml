@@ -1,0 +1,87 @@
+name: Windows Build (ProjectBunny)
+
+# Builds the DX12 DLL on hosted Windows runners so no local Windows
+# machine is needed for the compile + regression loop. The deploy
+# section of scripts/build-cmake.ps1 degrades gracefully on the runner
+# (no game directories -> "Skipped ..." warnings, non-fatal).
+#
+# Artifacts:
+#   d3d12-timing-x64  -> d3d12.dll (TIMING instrumentation) + PDB + Run.exe
+#   d3d12-release-x64 -> clean d3d12.dll + Run.exe
+# Deploy to D:\MMTCacheFolder\3Dmigoto\ZZMIDX12 on the gaming machine.
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-timing:
+    name: d3d12.dll - Release + TIMING instrumentation
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history: the dev-tests job restores dev_tests/ from 97a502d~1
+          fetch-depth: 0
+
+      - name: Build (build_release_timing_x64.ps1)
+        shell: pwsh
+        run: ./build_release_timing_x64.ps1
+
+      - name: Upload TIMING build
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d12-timing-x64
+          path: |
+            x64/Release/d3d12.dll
+            x64/Release/d3d12.pdb
+            x64/Release/Run.exe
+          if-no-files-found: warn
+
+  build-release:
+    name: d3d12.dll - clean Release (no instrumentation)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (build_release_x64.ps1)
+        shell: pwsh
+        run: ./build_release_x64.ps1
+
+      - name: Upload release build
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d12-release-x64
+          path: |
+            x64/Release/d3d12.dll
+            x64/Release/Run.exe
+          if-no-files-found: warn
+
+  # Advisory job: runs the /O2 descriptor-copy regression harness.
+  # dev_tests/ is NOT at HEAD - it must be restored from 97a502d~1 first
+  # (see HANDOVER-dx12-parity.md, patch #3 notes). If this job is red
+  # while both builds are green, suspect the harness environment before
+  # the code. Delete this job entirely if it needs CI-specific tuning.
+  dev-tests:
+    name: /O2 regression harness
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore dev_tests/ from 97a502d~1
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dev_tests)) {
+            git checkout "97a502d~1" -- dev_tests
+          }
+
+      - name: Run descriptor_copy_perf_test (/O2)
+        shell: pwsh
+        run: ./dev_tests/descriptor_copy_perf_test.ps1
