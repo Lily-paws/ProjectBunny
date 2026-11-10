@@ -1,49 +1,48 @@
+# ProjectBunny (fork)
 
+A fork of [StarBobis/ProjectBunny](https://github.com/StarBobis/ProjectBunny), a 3Dmigoto fork with DX11 and DX12 support.
 
-# Project Bunny 重装小兔
+The upstream repository is the canonical project. This fork focuses on refactoring the 3Dmigoto integration, particularly the DX12 path and its runtime performance. It is a working fork, not a separate release.
 
-[![GitHub stars](https://img.shields.io/github/stars/StarBobis/ProjectBunny?style=social)](https://github.com/StarBobis/ProjectBunny/stargazers) [![GitHub forks](https://img.shields.io/github/forks/StarBobis/ProjectBunny?style=social)](https://github.com/StarBobis/ProjectBunny/network/members) [![GitHub issues](https://img.shields.io/github/issues/StarBobis/ProjectBunny)](https://github.com/StarBobis/ProjectBunny/issues) [![GitHub license](https://img.shields.io/github/license/StarBobis/ProjectBunny)](https://github.com/StarBobis/ProjectBunny/blob/main/LICENSE.txt)
+## Changes in this fork
 
-This project is used to refactor and improve the original 3Dmigoto project, especially for DX12 part development.
+TBA
 
+## Potential changes
 
-# Core Change
+Work is targeted at the performance areas already identified in the DX12 path:
 
-- Use CMake to make it easy to dev and build.
-- Use Ninja to compile.
-- DX11 Part updated with SpectrumQT's XXMI-Libs-Package fork version of 3Dmigoto(DX11 Part Not Updated Anymore, only stay for reference,will remove in later version when DX12 part function fully developed).
-- DX12 Part Use C++ 20 Standard，instead of old C++14 standard.
-- Use VSCode to dev instead of old Visual Studio.
+- Heap relevance gating — skip descriptor work when a heap is not actually relevant to the operation
+- Reducing the self-overhead of the timing instrumentation
+- Caching of the prepare stage (prepared state and masks)
+- Trimming instrumentation out of the PSO/RSig lookup paths
+- Optimising the command-submission and resource-transition paths
+- Caching repeated CPU-side queries (e.g. shader modification-time checks)
 
-# Development Environment
+None of this touches gameplay or features.
 
-- Windows 11 Pro
-- VSCode
-- C++ Extension Pack [VSCode extension]
-- C++ 20 Standard
+## Relationship to upstream
 
-# Build
+This fork is based on the upstream project and tracks it. Where performance-related work touches the DX12 layer the code may drift, though the goal is to keep it mergeable.
 
-Build the Release x64 version:
+## Building
 
-```
+Windows, Visual Studio 2022 (Desktop development with C++ workload). CMake and Ninja are detected automatically if installed with VS.
+
+```powershell
 .\build_release_x64.ps1
 ```
 
-(32-bit builds are not currently maintained because there are very few use cases and users. The project focuses on x64 first.)
+Standard release build, producing the clean d3d12.dll.
 
-# Support Development
+```powershell
+.\build_release_timing_x64.ps1
+```
 
-<a href="https://afdian.com/a/NicoMico666"><img width="200" src="https://pic1.afdiancdn.com/static/img/welcome/button-sponsorme.png" alt=""></a>
+The same build with hot-path timing instrumentation enabled. This build is intended for log analysis rather than fps measurement, as the instrumentation itself adds overhead.
 
+Both scripts copy the output DLLs to `x64\Release`. If `build_config.json` points at a game directory they deploy there as well; otherwise the deploy step is skipped with a warning.
 
-# Star History
+## License
 
-![Star Trend](https://api.star-history.com/svg?repos=StarBobis/ProjectBunny&theme=default)
-
-
-# Special Thanks
-
-- Original 3Dmigoto Repository: https://github.com/bo3b/3Dmigoto
-- SpectrumQT's 3Dmigoto Fork Repository: https://github.com/SpectrumQT/XXMI-Libs-Package
-
+GPL-3.0, same as upstream. ProjectBunny by StarBobis; original 3Dmigoto by bo3b.
