@@ -621,10 +621,16 @@ static void RecordCopiedDescriptorBlock(
 			// the heap is active); fall through to the locked path if it ever
 			// happens.
 			if (result != DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::LockRequired) {
-				if (result == DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::SourceMissingDestinationErased) {
-					++scope.srcMissingErased;
-				} else if (result == DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::Changed) {
-					++scope.changedCalls;
+				if (result == DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::Changed ||
+					result == DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::SourceMissingDestinationErased) {
+					// Both rewrote the destination, so both republish its identity
+					// (an erase must invalidate the old value) and bump the heap
+					// version. Only the counter differs: erases are reported
+					// separately.
+					if (result == DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::SourceMissingDestinationErased)
+						++scope.srcMissingErased;
+					else
+						++scope.changedCalls;
 					DX12DescriptorHeapStateUtils::PublishRangeValue(
 						destination.heap, dstSlot, publishedValueId);
 					scope.commitSet.Add(destination.heap);
