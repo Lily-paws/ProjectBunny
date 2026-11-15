@@ -394,6 +394,20 @@ private:
 	static_assert((VersionPageSize & (VersionPageSize - 1)) == 0,
 		"descriptor version page size must be a power of two");
 
+	// One group covers 64 slots, so a whole-range pin or an epoch rotation is a
+	// handful of word operations rather than a per-slot loop, and all four bits
+	// of a group sit in one cache line. Declared at class scope, before
+	// VersionPage, because the public gate API and PeekGroup/EnsureGroup name it.
+	struct alignas(32) GateGroup
+	{
+		std::atomic<uint64_t> follow{0};
+		std::atomic<uint64_t> pinCur{0};
+		std::atomic<uint64_t> pinPrev{0};
+		std::atomic<uint64_t> stale{0};
+	};
+	static_assert(VersionPageSize % 64 == 0);
+	static_assert(sizeof(GateGroup) == 32);
+
 	// Per-slot publication state is interleaved so that one cache line holds
 	// the complete identity of two adjacent slots. The previous layout kept
 	// four parallel arrays, so every publish/validate touched up to four
@@ -425,17 +439,6 @@ private:
 		// Copy-gate bits live next to the version state so a page that exists
 		// for slot publication also owns the gate words for its slots; pages
 		// are allocated lazily, so a page with no writes carries no bits.
-		// One group covers 64 slots, so a whole-range pin or an epoch
-		// rotation is a handful of word operations rather than a per-slot
-		// loop, and all four bits of a group sit in one cache line.
-		struct alignas(32) GateGroup
-		{
-			std::atomic<uint64_t> follow{0};
-			std::atomic<uint64_t> pinCur{0};
-			std::atomic<uint64_t> pinPrev{0};
-			std::atomic<uint64_t> stale{0};
-		};
-		static_assert(VersionPageSize % 64 == 0);
 		std::array<GateGroup, VersionPageSize / 64> gate;
 
 		VersionPage()
