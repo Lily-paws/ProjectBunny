@@ -203,8 +203,11 @@ public:
 		srvDesc.Texture2D.MipLevels = resource->drawSrvMipLevels;
 		srvDesc.Texture2D.PlaneSlice = 0;
 		srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
-		device->CreateShaderResourceView(
-			resource->drawSrvTextureResource, &srvDesc, cpu);
+		{
+			DX12DescriptorModWrite::Guard modWriteGuard;
+			device->CreateShaderResourceView(
+				resource->drawSrvTextureResource, &srvDesc, cpu);
+		}
 	}
 
 	static void CreateSrvFromDesc(
@@ -215,8 +218,11 @@ public:
 	{
 		if (!device || !resource || !resource->drawSrvTextureResource || !cpu.ptr)
 			return;
-		device->CreateShaderResourceView(
-			resource->drawSrvTextureResource, &srvDesc, cpu);
+		{
+			DX12DescriptorModWrite::Guard modWriteGuard;
+			device->CreateShaderResourceView(
+				resource->drawSrvTextureResource, &srvDesc, cpu);
+		}
 	}
 
 	static D3D12_CPU_DESCRIPTOR_HANDLE EnsureCompatibleSrv(

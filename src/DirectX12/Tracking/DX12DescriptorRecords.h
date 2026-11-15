@@ -4,6 +4,87 @@
 
 #include "DX12DescriptorHeapShard.h"
 
+#include <cwctype>
+#include <string>
+
+// ---------------------------------------------------------------------------
+// Descriptor copy-gate mode (v2.3 per-slot copy gating)
+// ---------------------------------------------------------------------------
+// Dry run is the default: the gate bits evolve and the counters count, but
+// every record is still copied, so a dry-run frame is a fair predictor of
+// live mode at zero output risk. Live skips the record copy for slots nobody
+// needs. Once Live has run, DryRun is refused for the rest of the process:
+// a dry run assumes every shadow is exact and a live period leaves stale ones.
+enum class DescriptorGateMode : uint8_t { Off, DryRun, Live };
+
+// Requested by d3d12.ini ([System] descriptor_gate_mode); applied at startup.
+inline std::atomic<DescriptorGateMode>
+	gDescriptorGateMode{ DescriptorGateMode::DryRun };
+// Sticky: set the first time Live is applied, never cleared in-process.
+inline std::atomic<bool> gDescriptorGateWentLive{ false };
+
+inline DescriptorGateMode EffectiveGateMode() noexcept
+{
+	const DescriptorGateMode requested =
+		gDescriptorGateMode.load(std::memory_order_relaxed);
+	if (requested == DescriptorGateMode::DryRun &&
+			gDescriptorGateWentLive.load(std::memory_order_relaxed))
+		return DescriptorGateMode::Off;
+	return requested;
+}
+
+inline void ApplyDescriptorGateMode(DescriptorGateMode mode) noexcept
+{
+	if (mode == DescriptorGateMode::Live)
+		gDescriptorGateWentLive.store(true, std::memory_order_relaxed);
+	gDescriptorGateMode.store(mode, std::memory_order_relaxed);
+}
+
+// d3d12.ini [System] descriptor_gate_mode: off | dry_run | live.
+// Anything unrecognised falls back to dry_run.
+inline DescriptorGateMode ParseDescriptorGateMode(
+	const std::wstring &text) noexcept
+{
+	std::wstring lower = text;
+	for (wchar_t &ch : lower)
+		ch = static_cast<wchar_t>(std::towlower(ch));
+	if (lower == L"live")
+		return DescriptorGateMode::Live;
+	if (lower == L"off")
+		return DescriptorGateMode::Off;
+	return DescriptorGateMode::DryRun;
+}
+
+// Set while the mod's own code issues descriptor writes. Views created under
+// the guard are mod-relevant (follow), and copies the mod issues are always
+// mirrored. Guard restores (not clears) so guards nest.
+class DX12DescriptorModWrite
+{
+public:
+	static bool InProgress() noexcept { return inProgress; }
+
+	class Guard
+	{
+	public:
+		Guard() noexcept : saved_(inProgress) { inProgress = true; }
+		~Guard() { inProgress = saved_; }
+		Guard(const Guard&) = delete;
+		Guard &operator=(const Guard&) = delete;
+	private:
+		bool saved_;
+	};
+
+private:
+	inline static thread_local bool inProgress = false;
+};
+
+// Decides, at view creation, whether the new value is mod-relevant (the
+// `follow` gate bit). A false negative is safe but costly (the value gets
+// gated and a later read is refused); a false positive only costs a skipped
+// optimisation. Backed by the runtime snapshot's existing
+// textureOverridesByHash index - no second hash set.
+bool DX12CreateDescriptorFollowPredicate(uint32_t huntHash) noexcept;
+
 struct RootSignatureRecord
 {
 	ID3D12RootSignature *rootSignature = nullptr;

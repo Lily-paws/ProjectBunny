@@ -516,7 +516,10 @@ bool EnsureResourceUavLocked(
 	uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
 
 	resource->uavCpu = heap->GetCPUDescriptorHandleForHeapStart();
-	device->CreateUnorderedAccessView(uavResource, nullptr, &uavDesc, resource->uavCpu);
+	{
+		DX12DescriptorModWrite::Guard modWriteGuard;
+		device->CreateUnorderedAccessView(uavResource, nullptr, &uavDesc, resource->uavCpu);
+	}
 	resource->uavHeap = heap;
 	resource->uavResource = uavResource;
 	resource->uavByteWidth = uavByteWidth;
@@ -627,7 +630,10 @@ bool EnsureResourceSrvLocked(
 	srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
 
 	resource->srvCpu = heap->GetCPUDescriptorHandleForHeapStart();
-	device->CreateShaderResourceView(srvBacking, &srvDesc, resource->srvCpu);
+	{
+		DX12DescriptorModWrite::Guard modWriteGuard;
+		device->CreateShaderResourceView(srvBacking, &srvDesc, resource->srvCpu);
+	}
 	resource->srvHeap = heap;
 	resource->srvStride = elementStride;
 	resource->srvByteWidth = srvByteWidth;

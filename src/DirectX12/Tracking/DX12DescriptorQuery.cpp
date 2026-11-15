@@ -310,6 +310,7 @@ static void BuildResourceMetadataSnapshot(
 	std::vector<DescriptorRecord> heapDescriptors;
 	std::unordered_set<SIZE_T> heapDescriptorHandles;
 	size_t liveDescriptorCount = 0;
+	LONG64 skippedStale = 0;
 	for (const DescriptorHeapRecord &heap : gDescriptorHeaps) {
 		liveDescriptorCount += static_cast<size_t>(
 			DX12DescriptorSlotArrayUtils::ReadLiveSlots(&heap));
@@ -329,8 +330,12 @@ static void BuildResourceMetadataSnapshot(
 		// after it the dense vectors below are the authoritative snapshot.
 		if (!heap.IsMaterialized()) {
 			heap.chunkedSlots.ForEachOccupied(
-				[&heapDescriptors, &heapDescriptorHandles](
+				[&heap, &heapDescriptors, &heapDescriptorHandles, &skippedStale](
 					uint32_t slot, const DescriptorRecord &value) {
+					if (!DX12DescriptorHeapShadowUtils::IsSlotShadowTrusted(heap, slot)) {
+						++skippedStale;
+						return;
+					}
 					heapDescriptors.push_back(DescriptorRecord());
 					DX12DescriptorSlotArrayUtils::CopyRecordValueForSlot(
 						&heapDescriptors.back(), value, value.cpuHandle);
@@ -340,6 +345,10 @@ static void BuildResourceMetadataSnapshot(
 		for (UINT slot = 0; slot < heap.occupied.size() && slot < heap.slots.size(); ++slot) {
 			if (!heap.occupied[slot])
 				continue;
+			if (!DX12DescriptorHeapShadowUtils::IsSlotShadowTrusted(heap, slot)) {
+				++skippedStale;
+				continue;
+			}
 			heapDescriptors.push_back(DescriptorRecord());
 			DX12DescriptorSlotArrayUtils::CopyRecordValueForSlot(
 				&heapDescriptors.back(), heap.slots[slot],
@@ -349,6 +358,8 @@ static void BuildResourceMetadataSnapshot(
 		if (stateLocks)
 			stateLocks->UnlockAllExclusive();
 	}
+	if (skippedStale)
+		DX12_PROF_ADD_ITEMS("Desc.BulkSkippedStale", skippedStale);
 	for (const DescriptorRecord &record : heapDescriptors)
 		liveDescriptors.push_back(&record);
 	for (const std::pair<const SIZE_T, DescriptorRecord> &entry : gDescriptorByCpuHandle) {
@@ -596,7 +607,8 @@ bool DX12FindDescriptorSummaryByCpuHandleLight(
 			const DescriptorHeapRecord &heap = gDescriptorHeaps[location.heapIndex];
 			if (location.slot < heap.occupied.size() &&
 					location.slot < heap.slots.size() &&
-					heap.occupied[location.slot]) {
+					heap.occupied[location.slot] &&
+					DX12DescriptorHeapShadowUtils::IsSlotShadowTrusted(heap, location.slot)) {
 				FillDescriptorSummary(summary, heap.slots[location.slot], false, false, false);
 				ReleaseSRWLockShared(&gDescriptorLock);
 				return true;
@@ -639,7 +651,8 @@ static bool FillLightSummaryLocked(SIZE_T cpuHandle, DX12DescriptorSummary *summ
 			const DescriptorHeapRecord &heap = gDescriptorHeaps[location.heapIndex];
 			if (location.slot < heap.occupied.size() &&
 					location.slot < heap.slots.size() &&
-					heap.occupied[location.slot]) {
+					heap.occupied[location.slot] &&
+					DX12DescriptorHeapShadowUtils::IsSlotShadowTrusted(heap, location.slot)) {
 				FillDescriptorSummary(summary, heap.slots[location.slot], false, false, false);
 				return true;
 			}
@@ -818,6 +831,8 @@ void DX12FindDescriptorSummariesByHeapSlot(
 				summaries[i] = DX12DescriptorSummary();
 				const UINT slot = slots[i];
 				if (slot >= record.desc.NumDescriptors)
+					continue;
+				if (!DX12DescriptorHeapShadowUtils::AdmitSlotRead(record, slot))
 					continue;
 				DescriptorRecord recordCopy;
 				bool copied = false;

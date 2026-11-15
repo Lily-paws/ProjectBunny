@@ -416,6 +416,10 @@ void InvalidateDescriptorHeapLocked(ID3D12DescriptorHeap *heap)
 		stateLocks->LockAllExclusive();
 	if (stateLocks)
 		stateLocks->Deactivate();
+	// Heap retirement: forget every gate bit so a record reuse (same
+	// DescriptorHeapRecord, new heap) never inherits stale/follow/pin state.
+	if (stateLocks)
+		stateLocks->ClearAllGatingBits();
 	// gRuntimeDescriptorByCpuHandle removed - heap slots self-clean via ClearDescriptorHeapLocked
 	ClearDescriptorHeapLocked(&record);
 	record.heap = nullptr;
@@ -797,6 +801,8 @@ void CleanupTrackedResources()
 			stateLocks->LockAllExclusive();
 		if (stateLocks)
 			stateLocks->Deactivate();
+		if (stateLocks)
+			stateLocks->ClearAllGatingBits();
 		ClearDescriptorHeapLocked(&heap);
 		if (stateLocks)
 			stateLocks->UnlockAllExclusive();
@@ -1412,6 +1418,10 @@ void DX12PrimeDescriptorHistoryForHunting()
 		for (UINT slot = 0; slot < slotCount; ++slot) {
 			if (!DescriptorHeapSlotOccupied(heap, slot))
 				continue;
+			// A stale slot's shadow may differ from the GPU value; priming it
+			// into the hunt history would anchor the hunt on an unknown value.
+			if (stateLocks && stateLocks->IsSlotStale(slot))
+				continue;
 			occupied++;
 			if (slot < heap.slotHistory.size() && !heap.slotHistory[slot].empty())
 				continue;
@@ -1431,6 +1441,65 @@ void DX12PrimeDescriptorHistoryForHunting()
 		primed,
 		static_cast<unsigned long long>(gDescriptorEpoch),
 		DescriptorHeapHistoryEntriesLocked());
+	ReleaseSRWLockExclusive(&gDescriptorLock);
+}
+
+// Descriptor gate epoch tick: runs once per presented frame from the single
+// post-present funnel. Publishes the effective gate mode (0=off, 1=dry run,
+// 2=live) so log lines are attributable; every kPinEpochFrames presents it
+// also rotates the two pin generations on every live heap and publishes the
+// pinned total. Rotation only touches atomics, so the shared global lock is
+// enough (same protocol as the ledger touch in ResolveHeapSlotFast).
+void DX12DescriptorPinEpochTick(LONG presentCount)
+{
+	DX12_PROF_ADD_ITEMS("Desc.GateMode",
+		static_cast<LONG>(EffectiveGateMode()));
+	static constexpr LONG kPinEpochFrames = 256;   // must exceed one ring lap
+	if (presentCount % kPinEpochFrames != 0)
+		return;
+	uint64_t pinnedTotal = 0;
+	DX12_LOCK_ACQUIRE_SHARED(&gDescriptorLock, "Lock.Desc.GlobalShared");
+	for (DescriptorHeapRecord &heap : gDescriptorHeaps) {
+		if (heap.stateLocks && heap.stateLocks->IsActive())
+			pinnedTotal += heap.stateLocks->RotatePinGenerations();
+	}
+	ReleaseSRWLockShared(&gDescriptorLock);
+	DX12_PROF_ADD_ITEMS("Desc.PinnedAfterRotate", pinnedTotal);
+}
+
+// F10 reload sweep: after a successful mod reload, re-evaluate the shadow
+// values the game has already written against the new rules. v2.3
+// constraints: only `follow` may be set, and only on slots that are not
+// stale - a stale slot's shadow may differ from the GPU value, so it cannot
+// match a rule - and stale is never cleared here.
+void DX12RefreshDescriptorFollowCopiesOnIniReload()
+{
+	AcquireSRWLockExclusive(&gDescriptorLock);
+	for (DescriptorHeapRecord &heap : gDescriptorHeaps) {
+		DescriptorHeapRecord::StateLocks *stateLocks = heap.stateLocks.get();
+		if (!stateLocks || !stateLocks->IsActive())
+			continue;
+		stateLocks->LockAllExclusive();
+		if (!heap.IsMaterialized()) {
+			heap.chunkedSlots.ForEachOccupied(
+				[stateLocks](uint32_t slot, const DescriptorRecord &value) {
+					if (stateLocks->IsSlotStale(slot))
+						return;
+					if (DX12CreateDescriptorFollowPredicate(
+							value.descriptorHuntHash))
+						stateLocks->SetFollow(slot, true);
+				});
+		}
+		for (UINT slot = 0; slot < heap.occupied.size() && slot < heap.slots.size(); ++slot) {
+			if (!heap.occupied[slot])
+				continue;
+			if (stateLocks->IsSlotStale(slot))
+				continue;
+			if (DX12CreateDescriptorFollowPredicate(heap.slots[slot].descriptorHuntHash))
+				stateLocks->SetFollow(slot, true);
+		}
+		stateLocks->UnlockAllExclusive();
+	}
 	ReleaseSRWLockExclusive(&gDescriptorLock);
 }
 

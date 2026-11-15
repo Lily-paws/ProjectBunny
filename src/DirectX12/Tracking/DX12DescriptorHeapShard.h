@@ -4,6 +4,10 @@
 
 #include "DX12FrameAnalysisTracking.h"
 
+#include <algorithm>
+#include <bit>
+#include <utility>
+
 // Lock and version storage for one descriptor heap. Each shard occupies its
 // own cache line: packing SRWLOCKs or counters together would make unrelated
 // descriptor slots contend through false sharing even though their logical
@@ -270,6 +274,121 @@ public:
 		return version_.load(std::memory_order_acquire);
 	}
 
+	// ---- Per-slot copy-gate bits ----
+	// Four bits per slot, stored word-wise per 64-slot group. `stale` is the
+	// only correctness bit: every reader path checks it, so `stale` clear
+	// means the shadow is exact or absent. The other three only decide
+	// whether the gate may skip a copy into the slot.
+	enum GateBit : uint32_t { GateFollow = 1, GatePinned = 2, GateStale = 4 };
+
+	// Missing page means no bits: stale clear, and no shadow was ever
+	// mirrored there.
+	uint32_t LoadGateBits(uint32_t slot) const noexcept
+	{
+		const GateGroup *group = PeekGroup(slot);
+		if (!group)
+			return 0;
+		const uint64_t bit = SlotBit(slot);
+		uint32_t bits = 0;
+		if (group->follow.load(std::memory_order_relaxed) & bit)
+			bits |= GateFollow;
+		if ((group->pinCur.load(std::memory_order_relaxed) |
+			group->pinPrev.load(std::memory_order_relaxed)) & bit)
+			bits |= GatePinned;
+		if (group->stale.load(std::memory_order_acquire) & bit)
+			bits |= GateStale;
+		return bits;
+	}
+
+	bool IsSlotStale(uint32_t slot) const noexcept
+	{
+		const GateGroup *group = PeekGroup(slot);
+		return group &&
+			(group->stale.load(std::memory_order_acquire) & SlotBit(slot));
+	}
+
+	// PinSlot/PinSlotRange/SetFollow/SetStale may throw bad_alloc: a gate
+	// group is allocated with its version page, so page creation can fail.
+	void SetFollow(uint32_t slot, bool value)
+	{
+		if (GateGroup *group = value ? EnsureGroup(slot) : PeekGroup(slot))
+			StoreBit(group->follow, SlotBit(slot), value);
+	}
+
+	void SetStale(uint32_t slot, bool value)
+	{
+		if (GateGroup *group = value ? EnsureGroup(slot) : PeekGroup(slot))
+			StoreBit(group->stale, SlotBit(slot), value);
+	}
+
+	void PinSlot(uint32_t slot) { PinSlotRange(slot, 1); }
+
+	// Word-wise: one test and at most one OR per 64 slots.
+	void PinSlotRange(uint32_t first, uint32_t count)
+	{
+		if (count == 0 || first >= maxSlots_)
+			return;
+		const uint32_t end = static_cast<uint32_t>(
+			std::min<uint64_t>(uint64_t(first) + count, maxSlots_));
+		for (uint32_t slot = first; slot < end; ) {
+			const uint32_t groupEnd = std::min(end, (slot | 63u) + 1);
+			const uint32_t n = groupEnd - slot;
+			const uint64_t mask =
+				(n == 64 ? ~0ull : ((1ull << n) - 1)) << (slot & 63u);
+			if (GateGroup *group = EnsureGroup(slot))
+				OrBits(group->pinCur, mask);
+			slot = groupEnd;
+		}
+	}
+
+	// Returns how many slots are pinned after rotation, and re-evaluates the
+	// heap's gate switch with hysteresis (off above 50% of slots pinned, back
+	// on below 35% so it does not flap).
+	uint32_t RotatePinGenerations() noexcept
+	{
+		uint64_t pinned = 0;
+		for (uint32_t i = 0; i < versionPageCount_; ++i) {
+			VersionPage *page = versionPages_[i].load(std::memory_order_acquire);
+			if (!page)
+				continue;
+			for (GateGroup &group : page->gate) {
+				const uint64_t current =
+					group.pinCur.exchange(0, std::memory_order_acq_rel);
+				group.pinPrev.store(current, std::memory_order_release);
+				pinned += std::popcount(current);
+			}
+		}
+		const bool disabled = gatingDisabled_.load(std::memory_order_relaxed);
+		if (!disabled && pinned * 2 > maxSlots_)
+			gatingDisabled_.store(true, std::memory_order_relaxed);
+		else if (disabled && pinned * 100 < uint64_t(maxSlots_) * 35)
+			gatingDisabled_.store(false, std::memory_order_relaxed);
+		return static_cast<uint32_t>(pinned);
+	}
+
+	bool GatingDisabled() const noexcept
+	{
+		return gatingDisabled_.load(std::memory_order_relaxed);
+	}
+
+	// Heap retirement or ID reuse: forget everything, including the hysteresis
+	// switch, so a reused record starts clean.
+	void ClearAllGatingBits() noexcept
+	{
+		for (uint32_t i = 0; i < versionPageCount_; ++i) {
+			VersionPage *page = versionPages_[i].load(std::memory_order_acquire);
+			if (!page)
+				continue;
+			for (GateGroup &group : page->gate) {
+				group.follow.store(0, std::memory_order_relaxed);
+				group.pinCur.store(0, std::memory_order_relaxed);
+				group.pinPrev.store(0, std::memory_order_relaxed);
+				group.stale.store(0, std::memory_order_release);
+			}
+		}
+		gatingDisabled_.store(false, std::memory_order_relaxed);
+	}
+
 private:
 	static constexpr uint32_t VersionPageSize = 256;
 	static_assert((VersionPageSize & (VersionPageSize - 1)) == 0,
@@ -303,6 +422,22 @@ private:
 			"two slot states should fill one cache line");
 		std::array<SlotState, VersionPageSize> slots;
 
+		// Copy-gate bits live next to the version state so a page that exists
+		// for slot publication also owns the gate words for its slots; pages
+		// are allocated lazily, so a page with no writes carries no bits.
+		// One group covers 64 slots, so a whole-range pin or an epoch
+		// rotation is a handful of word operations rather than a per-slot
+		// loop, and all four bits of a group sit in one cache line.
+		struct alignas(32) GateGroup
+		{
+			std::atomic<uint64_t> follow{0};
+			std::atomic<uint64_t> pinCur{0};
+			std::atomic<uint64_t> pinPrev{0};
+			std::atomic<uint64_t> stale{0};
+		};
+		static_assert(VersionPageSize % 64 == 0);
+		std::array<GateGroup, VersionPageSize / 64> gate;
+
 		VersionPage()
 		{
 			for (SlotState &slot : slots) {
@@ -334,8 +469,62 @@ private:
 		return expected;
 	}
 
+	static constexpr uint64_t SlotBit(uint32_t slot) noexcept
+	{
+		return 1ull << (slot & 63u);
+	}
+
+	// Index of the 64-slot group inside its page.
+	static constexpr uint32_t GroupIndex(uint32_t slot) noexcept
+	{
+		return (slot & (VersionPageSize - 1)) >> 6;
+	}
+
+	const GateGroup *PeekGroup(uint32_t slot) const noexcept
+	{
+		if (!versionPages_ || slot >= maxSlots_)
+			return nullptr;
+		const VersionPage *page =
+			versionPages_[slot / VersionPageSize].load(std::memory_order_acquire);
+		return page ? &page->gate[GroupIndex(slot)] : nullptr;
+	}
+
+	GateGroup *PeekGroup(uint32_t slot) noexcept
+	{
+		return const_cast<GateGroup *>(std::as_const(*this).PeekGroup(slot));
+	}
+
+	// Throws bad_alloc like EnsureVersionPage does; callers that allocate
+	// pages (SetFollow, SetStale, PinSlotRange) therefore cannot be noexcept.
+	GateGroup *EnsureGroup(uint32_t slot)
+	{
+		VersionPage *page = EnsureVersionPage(slot);   // page index is slot / 256
+		return page ? &page->gate[GroupIndex(slot)] : nullptr;
+	}
+
+	// Test before read-modify-write: a locked instruction is only paid when
+	// the bit actually changes. Most copies leave it as it was.
+	static void StoreBit(
+		std::atomic<uint64_t> &word, uint64_t bit, bool value) noexcept
+	{
+		if (value) {
+			if (!(word.load(std::memory_order_relaxed) & bit))
+				word.fetch_or(bit, std::memory_order_release);
+		} else if (word.load(std::memory_order_relaxed) & bit) {
+			word.fetch_and(~bit, std::memory_order_release);
+		}
+	}
+
+	static void OrBits(std::atomic<uint64_t> &word, uint64_t mask) noexcept
+	{
+		if ((word.load(std::memory_order_relaxed) & mask) != mask)
+			word.fetch_or(mask, std::memory_order_relaxed);
+	}
+
 	std::atomic<bool> materialized_{false};
 	std::atomic<bool> active_{true};
+	// Gate switch of this heap, re-evaluated with the pin-generation rotation.
+	std::atomic<bool> gatingDisabled_{false};
 	std::array<LockCell, ShardCount> locks_;
 	// Consumers only need a non-zero token that changes after any Descriptor
 	// State write. Keeping 1024 per-shard counters made every cache validation

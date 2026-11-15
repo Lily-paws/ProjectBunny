@@ -401,6 +401,9 @@ struct DescriptorCopyCallScope
 	LONG64 unchangedCalls = 0;
 	LONG64 lockedPathCalls = 0;
 	LONG64 ledgerFallbackCalls = 0;
+	LONG64 gatedSlots = 0;
+	LONG64 propagatedSlots = 0;
+	LONG64 srcMissingErased = 0;
 	// Changed slots publish their own seqlock identities immediately (readers
 	// rely on them), while the heap-wide invalidation token - which consumers
 	// only require to change once per completed API call - is bumped once per
@@ -426,7 +429,44 @@ static void FinishCopiedDescriptorCall(DescriptorCopyCallScope &scope)
 	DX12_PROF_ADD_CALLS("Rm.DescCopyUnchanged", scope.unchangedCalls);
 	DX12_PROF_ADD_CALLS("Rm.DescCopyLockedPath", scope.lockedPathCalls);
 	DX12_PROF_ADD_CALLS("Rm.DescCopyLedgerFallback", scope.ledgerFallbackCalls);
+	if (scope.gatedSlots)
+		DX12_PROF_ADD_ITEMS("Desc.Gated", scope.gatedSlots);
+	if (scope.propagatedSlots)
+		DX12_PROF_ADD_ITEMS("Desc.Propagated", scope.propagatedSlots);
+	if (scope.srcMissingErased)
+		DX12_PROF_ADD_ITEMS("Desc.SrcMissingErased", scope.srcMissingErased);
 	scope.commitSet.CommitAll();
+}
+
+enum class SlotCopyAction : uint8_t { Mirror, Gate, Propagate };
+
+static SlotCopyAction ClassifySlotCopy(
+	uint32_t srcBits, uint32_t dstBits, bool gateEnabled) noexcept
+{
+	using Locks = DescriptorHeapRecord::StateLocks;
+	if (srcBits & Locks::GateStale)
+		return SlotCopyAction::Propagate;   // never copy from an unknown source
+	const bool needed = (srcBits & Locks::GateFollow) != 0 ||
+		(dstBits & (Locks::GateFollow | Locks::GatePinned)) != 0;
+	return (needed || !gateEnabled) ? SlotCopyAction::Mirror : SlotCopyAction::Gate;
+}
+
+// After a mirrored slot has been stored (or erased). Order: store first, bits
+// after, so a lock-free reader never sees fresh bits over an unwritten slot.
+static void CommitMirroredSlotBits(
+	DescriptorHeapRecord::StateLocks *dstLocks, UINT dstSlot,
+	bool srcFollow, bool erased)
+{
+	dstLocks->SetFollow(dstSlot, srcFollow && !erased);
+	dstLocks->SetStale(dstSlot, false);
+}
+
+static DescriptorHeapRecord::StateLocks *ActiveStateLocks(
+	const DX12DescriptorHeapShadowUtils::ResolvedHeapSlot &side) noexcept
+{
+	DescriptorHeapRecord::StateLocks *locks =
+		side.heap ? side.heap->stateLocks.get() : nullptr;
+	return (locks && locks->IsActive()) ? locks : nullptr;
 }
 
 // Records one already-expanded block of a descriptor copy: `numDescriptors`
@@ -449,13 +489,15 @@ static void RecordCopiedDescriptorBlock(
 
 	DX12DescriptorHeapShadowUtils::ResolvedHeapSlot source;
 	DX12DescriptorHeapShadowUtils::ResolvedHeapSlot destination;
-	const bool resolvedBoth =
+	// Both sides resolve independently: a failed source must not hide the
+	// destination, whose bits and locked path still need to run.
+	const bool sourceResolved = DX12DescriptorHeapShadowUtils::ResolveHeapSlotFast(
+		srcDescriptorRangeStart.ptr, scope.heapType, &source);
+	const bool destinationResolved = scope.destinationMemo ?
+		scope.destinationMemo->Resolve(destDescriptorRangeStart.ptr, scope.heapType, &destination) :
 		DX12DescriptorHeapShadowUtils::ResolveHeapSlotFast(
-			srcDescriptorRangeStart.ptr, scope.heapType, &source) &&
-		(scope.destinationMemo ?
-			scope.destinationMemo->Resolve(destDescriptorRangeStart.ptr, scope.heapType, &destination) :
-			DX12DescriptorHeapShadowUtils::ResolveHeapSlotFast(
-				destDescriptorRangeStart.ptr, scope.heapType, &destination));
+			destDescriptorRangeStart.ptr, scope.heapType, &destination);
+	const bool resolvedBoth = sourceResolved && destinationResolved;
 	// A failed resolve leaves that side at the default nullptr heap, so every
 	// heap access below is guarded: the stateLocks test precedes its own
 	// dereference, and the materialization flags are only read through a present
@@ -478,6 +520,16 @@ static void RecordCopiedDescriptorBlock(
 	// once per call.
 	const bool chunkFast = heapsActive &&
 		!sourceMaterialized && !destinationMaterialized && !scope.dumpOrHunt;
+	DescriptorHeapRecord::StateLocks *srcLocks = ActiveStateLocks(source);
+	DescriptorHeapRecord::StateLocks *dstLocks = ActiveStateLocks(destination);
+	const DescriptorGateMode gateMode = EffectiveGateMode();
+	const bool dryRun = gateMode != DescriptorGateMode::Live;
+	const bool modWrite = DX12DescriptorModWrite::InProgress();
+	const bool mirrorAll = modWrite || gateMode == DescriptorGateMode::Off;
+	// Gate switch is per destination heap and refreshed each epoch; chunkFast
+	// already excludes materialized heaps and dump/hunt.
+	const bool gateEnabled = chunkFast && !mirrorAll && dstLocks &&
+		!dstLocks->GatingDisabled();
 	const bool reverse = destDescriptorRangeStart.ptr > srcDescriptorRangeStart.ptr;
 	// Chunk presence is cached per 4096-slot chunk boundary, so a contiguous
 	// range pays two chunk-pointer loads per chunk instead of per slot.
@@ -504,6 +556,36 @@ static void RecordCopiedDescriptorBlock(
 			static_cast<SIZE_T>(i) * increment;
 		const UINT srcSlot = source.slot + i;
 		const UINT dstSlot = destination.slot + i;
+		SlotCopyAction action = SlotCopyAction::Mirror;
+		bool srcFollow = false;
+		if (srcLocks && dstLocks) {
+			const uint32_t srcBits = srcLocks->LoadGateBits(srcSlot);
+			const uint32_t dstBits = dstLocks->LoadGateBits(dstSlot);
+			action = ClassifySlotCopy(srcBits, dstBits, gateEnabled);
+			srcFollow = (srcBits & DescriptorHeapRecord::StateLocks::GateFollow) != 0 || modWrite;
+			if (action != SlotCopyAction::Mirror) {
+				dstLocks->SetStale(dstSlot, true);
+				dstLocks->SetFollow(dstSlot, srcFollow);
+				// A needed destination behind a stale source would stay stale
+				// forever: the source is unpinned, so it is gated again every
+				// write. Pin it back so its next write mirrors and the chain
+				// heals.
+				if (action == SlotCopyAction::Propagate &&
+					(dstBits & (DescriptorHeapRecord::StateLocks::GateFollow |
+						DescriptorHeapRecord::StateLocks::GatePinned)) != 0)
+					srcLocks->PinSlot(srcSlot);
+				(action == SlotCopyAction::Gate ? scope.gatedSlots
+					: scope.propagatedSlots)++;
+				if (!dryRun) {
+					scope.commitSet.Add(destination.heap);   // heap-version bump (G2)
+					continue;                                // live: copy skipped
+				}
+			}
+		} else if (dstLocks) {
+			// Source heap unresolved: its value is unknown, so keep the
+			// destination followed; the locked path below mirrors or erases it.
+			srcFollow = true;
+		}
 		const UINT srcChunk = srcSlot / kChunkSlots;
 		const UINT dstChunk = dstSlot / kChunkSlots;
 		if (srcChunk != curSrcChunk) {
@@ -539,8 +621,9 @@ static void RecordCopiedDescriptorBlock(
 			// the heap is active); fall through to the locked path if it ever
 			// happens.
 			if (result != DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::LockRequired) {
-				if (result == DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::Changed ||
-					result == DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::SourceMissingDestinationErased) {
+				if (result == DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::SourceMissingDestinationErased) {
+					++scope.srcMissingErased;
+				} else if (result == DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::Changed) {
 					++scope.changedCalls;
 					DX12DescriptorHeapStateUtils::PublishRangeValue(
 						destination.heap, dstSlot, publishedValueId);
@@ -553,14 +636,29 @@ static void RecordCopiedDescriptorBlock(
 					// shrinking the per-slot payload is worth it.
 					++scope.unchangedCalls;
 				}
+				// For Changed, Erased and Unchanged alike the mirrored slot's
+				// shadow now equals the source, so the bits commit here, after
+				// the store. LockRequired falls through to the locked path,
+				// which commits after its own store.
+				if (action == SlotCopyAction::Mirror && dstLocks)
+					CommitMirroredSlotBits(dstLocks, dstSlot, srcFollow,
+						result == DX12DescriptorSlotArrayUtils::CopyCurrentSlotResult::SourceMissingDestinationErased);
 				continue;
 			}
 		}
 		DescriptorRecord record;
 		++scope.lockedPathCalls;
 		blockTookLockedPath = true;
-		if (!DX12DescriptorHeapShadowUtils::FindLatestDescriptor(srcHandle, &record)) {
+		// Internal: no pin, no refusal. This is the shadow's own copy machinery
+		// reading its source; the classification above already handled staleness.
+		const bool foundSource =
+			DX12DescriptorHeapShadowUtils::FindLatestDescriptor(
+				srcHandle, &record,
+				DX12DescriptorHeapShadowUtils::SlotReadIntent::Internal);
+		if (!foundSource) {
 			DX12DescriptorHeapShadowUtils::EraseDescriptor(destHandle);
+			if (action == SlotCopyAction::Mirror && dstLocks)
+				CommitMirroredSlotBits(dstLocks, dstSlot, srcFollow, /*erased=*/true);
 			continue;
 		}
 		record.cpuHandle = destHandle;
@@ -572,6 +670,8 @@ static void RecordCopiedDescriptorBlock(
 			++scope.ledgerFallbackCalls;
 			DX12DescriptorHeapShadowUtils::WriteToCpuLedger(std::move(record));
 		}
+		if (action == SlotCopyAction::Mirror && dstLocks)
+			CommitMirroredSlotBits(dstLocks, dstSlot, srcFollow, /*erased=*/!foundSource);
 	}
 	if (blockTookLockedPath)
 		++scope.lockedBlocks;

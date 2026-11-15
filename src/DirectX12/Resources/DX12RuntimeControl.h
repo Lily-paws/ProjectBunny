@@ -128,6 +128,14 @@ public:
 			DX12_LOG("DX12Config",
 				"\"path\":\"%S\"",
 				Config.Path().c_str());
+			// Descriptor copy gating mode: [System] descriptor_gate_mode =
+			// off | dry_run | live (dry_run is the default and the value for
+			// anything unrecognised). Startup-only: a reload does not re-read
+			// runtime settings, so the mode is fixed for this process.
+			std::wstring gateModeText;
+			if (Config.Ini().GetString(L"System", L"descriptor_gate_mode",
+					&gateModeText))
+				ApplyDescriptorGateMode(ParseDescriptorGateMode(gateModeText));
 			DX12ModScheduleInitialLoad(Config.Path().c_str());
 			DX12OverlayStatusState::SetStatus(
 				L"DX12 mod load deferred until startup reload");

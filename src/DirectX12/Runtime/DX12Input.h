@@ -25,6 +25,10 @@ public:
 			"\"status\":\"done_sync\",\"result\":\"%s\",\"elapsedMs\":%lu",
 			ok ? "ok" : "failed", elapsed);
 		DX12ModRefreshRuntimeStateAfterReload();
+		// Re-seed the descriptor gate `follow` bits against the reloaded
+		// rules so existing shadow values are not stranded ungated.
+		if (ok)
+			DX12RefreshDescriptorFollowCopiesOnIniReload();
 		InterlockedExchange(&ReloadInProgress, 0);
 	}
 

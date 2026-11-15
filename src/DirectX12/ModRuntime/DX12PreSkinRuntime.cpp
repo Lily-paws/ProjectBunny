@@ -784,8 +784,11 @@ bool AcquirePreSkinOutputResizeCacheEntry(
 	uavDesc.Buffer.StructureByteStride = stride;
 	uavDesc.Buffer.NumElements = elementCount;
 	uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
-	device->CreateUnorderedAccessView(
-		createdResource, nullptr, &uavDesc, createdCpu);
+	{
+		DX12DescriptorModWrite::Guard modWriteGuard;
+		device->CreateUnorderedAccessView(
+			createdResource, nullptr, &uavDesc, createdCpu);
+	}
 
 	DX12PreSkinOutputResizeCacheEntry releaseEntry;
 	DX12_LOCK_ACQUIRE_EXCLUSIVE(&gPreSkinOutputResizeCacheLock, "Lock.outputResizeCacheExclusive");
@@ -2732,7 +2735,10 @@ bool PatchPreSkinVertexCountCbvLocked(
 		D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
 		cbvDesc.BufferLocation = patchedAddress;
 		cbvDesc.SizeInBytes = viewBytes;
-		device->CreateConstantBufferView(&cbvDesc, dst);
+		{
+			DX12DescriptorModWrite::Guard modWriteGuard;
+			device->CreateConstantBufferView(&cbvDesc, dst);
+		}
 
 		// The cache-capacity clear above also retired the CPU descriptor slots.
 		// A failed acquire only disables caching, not this dispatch's patch.
@@ -2740,7 +2746,10 @@ bool PatchPreSkinVertexCountCbvLocked(
 			AcquirePreSkinCbvPatchDescriptor(device);
 		if (cachedCpu.ptr)
 		{
-			device->CreateConstantBufferView(&cbvDesc, cachedCpu);
+			{
+				DX12DescriptorModWrite::Guard modWriteGuard;
+				device->CreateConstantBufferView(&cbvDesc, cachedCpu);
+			}
 			DX12PreSkinCbvPatchCacheEntry entry;
 			entry.patchedResource = patchedResource;
 			entry.cbvCpu = cachedCpu;

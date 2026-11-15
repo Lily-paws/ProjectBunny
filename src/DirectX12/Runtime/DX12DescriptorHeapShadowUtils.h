@@ -297,7 +297,8 @@ public:
 	static bool ResolveHeapSlotFast(
 		SIZE_T cpuHandle,
 		D3D12_DESCRIPTOR_HEAP_TYPE requiredType,
-		ResolvedHeapSlot *out)
+		ResolvedHeapSlot *out,
+		bool remember = true)
 	{
 		if (!cpuHandle || !out)
 			return false;
@@ -318,8 +319,10 @@ public:
 			out->heap = memo.heap;
 			out->heapIndex = memo.heapIndex;
 			out->slot = memo.slot + 1;
-			sSequentialResolve.handle = cpuHandle;
-			sSequentialResolve.slot = out->slot;
+			if (remember) {
+				sSequentialResolve.handle = cpuHandle;
+				sSequentialResolve.slot = out->slot;
+			}
 			return true;
 		}
 		static thread_local HeapResolveTlsCache cache;
@@ -344,15 +347,18 @@ public:
 			out->heap = entry.heap;
 			out->heapIndex = entry.heapIndex;
 			out->slot = static_cast<UINT>(slot);
-			// Descriptor traffic normally alternates between one staging heap and
-			// one shader-visible heap. Promote the hit so that pattern resolves in
-			// one or two probes instead of scanning all cached heaps under /Od.
-			// Entry 0/1 normally form the stable destination/source heap pair.
-			// Swapping an index-1 hit made alternating CopyDescriptors traffic
-			// exchange both cache records twice for every copied slot.
-			if (index > 1)
-				std::swap(cache.entries[0], cache.entries[index]);
-			RememberSequentialResolve(cpuHandle, *out);
+			if (remember) {
+				// Descriptor traffic normally alternates between one staging heap
+				// and one shader-visible heap. Promote the hit so that pattern
+				// resolves in one or two probes instead of scanning all cached
+				// heaps under /Od. Entry 0/1 normally form the stable
+				// destination/source heap pair. Swapping an index-1 hit made
+				// alternating CopyDescriptors traffic exchange both cache records
+				// twice for every copied slot.
+				if (index > 1)
+					std::swap(cache.entries[0], cache.entries[index]);
+				RememberSequentialResolve(cpuHandle, *out);
+			}
 			return true;
 		}
 
@@ -362,16 +368,18 @@ public:
 		// would cost a 32-entry memmove on every second-level hit.
 		if (HeapCacheLookup(cpuHandle, requiredType, out)) {
 			DX12_PROF_COUNT("Lock.Desc.HeapCacheHit");
-			static thread_local UINT tlsVictim = 0;
-			HeapResolveCacheEntry &victim = cache.entries[
-				tlsVictim++ & (HeapResolveTlsCache::EntryCount - 1)];
-			victim.heap = out->heap;
-			victim.heapIndex = out->heapIndex;
-			victim.cpuStart = out->heap->cpuStart;
-			victim.increment = out->heap->increment;
-			victim.numDescriptors = out->heap->desc.NumDescriptors;
-			victim.type = out->heap->desc.Type;
-			RememberSequentialResolve(cpuHandle, *out);
+			if (remember) {
+				static thread_local UINT tlsVictim = 0;
+				HeapResolveCacheEntry &victim = cache.entries[
+					tlsVictim++ & (HeapResolveTlsCache::EntryCount - 1)];
+				victim.heap = out->heap;
+				victim.heapIndex = out->heapIndex;
+				victim.cpuStart = out->heap->cpuStart;
+				victim.increment = out->heap->increment;
+				victim.numDescriptors = out->heap->desc.NumDescriptors;
+				victim.type = out->heap->desc.Type;
+				RememberSequentialResolve(cpuHandle, *out);
+			}
 			return true;
 		}
 
@@ -385,24 +393,30 @@ public:
 			return false;
 		}
 		DescriptorHeapRecord *heap = &gDescriptorHeaps[heapIndex];
-		static_assert(HeapResolveTlsCache::EntryCount >= 2,
-			"heap resolve cache needs one MRU and at least one victim");
-		for (size_t index = HeapResolveTlsCache::EntryCount - 1;
-				index > 0; --index)
-			cache.entries[index] = cache.entries[index - 1];
-		HeapResolveCacheEntry &entry = cache.entries[0];
-		entry.heap = heap;
-		entry.heapIndex = heapIndex;
-		entry.cpuStart = heap->cpuStart;
-		entry.increment = heap->increment;
-		entry.numDescriptors = heap->desc.NumDescriptors;
-		entry.type = heap->desc.Type;
+		if (remember) {
+			static_assert(HeapResolveTlsCache::EntryCount >= 2,
+				"heap resolve cache needs one MRU and at least one victim");
+			for (size_t index = HeapResolveTlsCache::EntryCount - 1;
+					index > 0; --index)
+				cache.entries[index] = cache.entries[index - 1];
+			HeapResolveCacheEntry &entry = cache.entries[0];
+			entry.heap = heap;
+			entry.heapIndex = heapIndex;
+			entry.cpuStart = heap->cpuStart;
+			entry.increment = heap->increment;
+			entry.numDescriptors = heap->desc.NumDescriptors;
+			entry.type = heap->desc.Type;
+		}
 		out->heap = heap;
 		out->heapIndex = heapIndex;
 		out->slot = slot;
+		// The shared heap cache is a pure lookup accelerator; keeping it in
+		// sync on quiet resolves costs little and helps the next lookup, so
+		// it stays written even when remember is false.
 		HeapCacheStore(cpuHandle, *out);
 		ReleaseSRWLockShared(&gDescriptorLock);
-		RememberSequentialResolve(cpuHandle, *out);
+		if (remember)
+			RememberSequentialResolve(cpuHandle, *out);
 		return true;
 	}
 
@@ -538,6 +552,19 @@ public:
 				resolved.heap->stateLocks->PublishedSlotValueEquals(
 					resolved.slot,
 					record.valueId)) {
+				// The game just wrote this exact value, so the shadow is exact
+				// again and any provenance left by an earlier copy chain is out
+				// of date. Re-evaluate only when a stale bit was set: the stale
+				// branch is already an extra test, so the predicate cost lands
+				// only on slots that need it.
+				DescriptorHeapRecord::StateLocks *locks =
+					resolved.heap->stateLocks.get();
+				if (locks->IsSlotStale(resolved.slot)) {
+					locks->SetFollow(resolved.slot,
+						DX12CreateDescriptorFollowPredicate(
+							record.descriptorHuntHash));
+					locks->SetStale(resolved.slot, false);
+				}
 				ReleaseDescriptorRecordResources(&record);
 				return false;
 			}
@@ -549,6 +576,10 @@ public:
 				resolved.heap->stateLocks &&
 				resolved.heap->stateLocks->IsActive()) {
 			DescriptorHeapRecord &heap = *resolved.heap;
+			// Gate create path: provenance before the store, staleness cleared
+			// after it, so no reader ever sees fresh over an unwritten slot.
+			heap.stateLocks->SetFollow(resolved.slot,
+				DX12CreateDescriptorFollowPredicate(record.descriptorHuntHash));
 			const bool changed =
 				DX12DescriptorSlotArrayUtils::StoreCurrentRecordIfChanged(
 					&heap, resolved.slot, record, cpuHandle) ==
@@ -560,6 +591,7 @@ public:
 				// publishes directly (see DX12DescriptorHeapStateUtils).
 				DX12DescriptorHeapStateUtils::PublishValue(
 					&heap, resolved.slot, record.valueId);
+			heap.stateLocks->SetStale(resolved.slot, false);
 			ReleaseDescriptorRecordResources(&record);
 			return changed;
 		}
@@ -575,6 +607,8 @@ public:
 				resolved.heap->stateLocks->IsActive() &&
 				!DX12ResourceTrackingPolicyUtils::NeedsDumpOrHuntingTracking()) {
 			DescriptorHeapRecord &heap = *resolved.heap;
+			heap.stateLocks->SetFollow(resolved.slot,
+				DX12CreateDescriptorFollowPredicate(record.descriptorHuntHash));
 			const DX12DescriptorSlotArrayUtils::StoreCurrentSlotResult result =
 				DX12DescriptorSlotArrayUtils::StoreCurrentRecordIfChanged(
 					&heap, resolved.slot, record, cpuHandle);
@@ -588,6 +622,7 @@ public:
 				if (!heap.IsMaterialized()) {
 					DX12DescriptorHeapStateUtils::PublishValue(
 						&heap, resolved.slot, record.valueId);
+					heap.stateLocks->SetStale(resolved.slot, false);
 					ReleaseDescriptorRecordResources(&record);
 					return true;
 				}
@@ -605,6 +640,7 @@ public:
 						locked.heap, locked.slot, record, cpuHandle);
 					DX12DescriptorHeapStateUtils::BumpVersion(
 						locked.heap, locked.slot);
+					locked.heap->stateLocks->SetStale(locked.slot, false);
 					UnlockHeapSlot(locked, true);
 					ReleaseDescriptorRecordResources(&record);
 				} else {
@@ -641,12 +677,15 @@ public:
 		DescriptorHeapRecord &heap = *resolved.heap;
 		if (!heap.IsMaterialized())
 			heap.chunkedSlots.EnsureChunkForSlot(resolved.slot);
+		heap.stateLocks->SetFollow(resolved.slot,
+			DX12CreateDescriptorFollowPredicate(record.descriptorHuntHash));
 		const bool changed =
 			DX12DescriptorSlotArrayUtils::StoreCurrentRecordIfChanged(
 				&heap, resolved.slot, record, cpuHandle) ==
 				DX12DescriptorSlotArrayUtils::StoreCurrentSlotResult::Stored;
 		if (changed)
 			DX12DescriptorHeapStateUtils::BumpVersion(&heap, resolved.slot);
+		heap.stateLocks->SetStale(resolved.slot, false);
 		UnlockHeapSlot(resolved, true);
 
 		ReleaseDescriptorRecordResources(&record);
@@ -677,6 +716,16 @@ public:
 		if (resolvedKnownHeap && resolved.heap && resolved.heap->stateLocks &&
 			resolved.heap->stateLocks->PublishedSlotValueEquals(
 				resolved.slot, valueId)) {
+			// Same early-return contract as RecordCreatedDescriptorIfChanged:
+			// the value is exact again, so heal a stale bit. CBVs never carry
+			// a hunt hash, so the predicate only sees Off-mode and mod writes.
+			DescriptorHeapRecord::StateLocks *locks =
+				resolved.heap->stateLocks.get();
+			if (locks->IsSlotStale(resolved.slot)) {
+				locks->SetFollow(resolved.slot,
+					DX12CreateDescriptorFollowPredicate(0));
+				locks->SetStale(resolved.slot, false);
+			}
 			return false;
 		}
 
@@ -762,10 +811,58 @@ public:
 		return true;
 	}
 
+	// Consumer hands a value to the mod: pins the slot and refuses a stale
+	// one. Internal is a read issued by the shadow's own copy machinery (the
+	// locked copy path's FindLatestDescriptor): it pins nothing and refuses
+	// nothing, because that path classified the source as Propagate and a
+	// stale source is never copied.
+	enum class SlotReadIntent : uint8_t { Consumer, Internal };
+
+	// Returns true when the shadow record for this slot may be handed to a
+	// caller. Pins the slot either way: a refused reader is exactly the
+	// interest we want to remember, so the next copy into this slot is
+	// mirrored. Stale is tolerated while the effective mode is a dry run -
+	// the dry-run shadow is exact by construction, so a refusal there is just
+	// a count of what live mode would refuse.
+	static bool AdmitSlotRead(const DescriptorHeapRecord &heap, UINT slot)
+	{
+		if (!heap.stateLocks)
+			return true;
+		heap.stateLocks->PinSlot(slot);
+		if (!heap.stateLocks->IsSlotStale(slot))
+			return true;
+		DX12_PROF_COUNT("Desc.StaleReads");
+		return EffectiveGateMode() == DescriptorGateMode::DryRun;
+	}
+
+	// Same check without pinning, for fallbacks and bulk walkers that
+	// shouldn't create interest.
+	static bool IsSlotShadowTrusted(
+		const DescriptorHeapRecord &heap, UINT slot) noexcept
+	{
+		return !heap.stateLocks || !heap.stateLocks->IsSlotStale(slot) ||
+			EffectiveGateMode() == DescriptorGateMode::DryRun;
+	}
+
+	// The mod is about to read this table's slots at draw time; pin them so
+	// the next copies into them are mirrored. Resolves without touching the
+	// sequential memo or TLS cache that the copy path relies on.
+	static void PinTableSlots(
+		SIZE_T tableCpuStart, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT count)
+	{
+		ResolvedHeapSlot resolved;
+		if (!ResolveHeapSlotFast(
+				tableCpuStart, type, &resolved, /*remember=*/false))
+			return;
+		if (resolved.heap->stateLocks)
+			resolved.heap->stateLocks->PinSlotRange(resolved.slot, count);
+	}
+
 	static bool ReadDescriptorFromSlot(
 		SIZE_T cpuHandle,
 		D3D12_DESCRIPTOR_HEAP_TYPE requiredType,
-		DescriptorRecord *outRecord)
+		DescriptorRecord *outRecord,
+		SlotReadIntent intent = SlotReadIntent::Consumer)
 	{
 		if (!outRecord) {
 			return false;
@@ -775,6 +872,9 @@ public:
 		if (!ResolveHeapSlotFast(cpuHandle, requiredType, &resolved))
 			return false;
 		DescriptorHeapRecord &heap = *resolved.heap;
+		if (intent == SlotReadIntent::Consumer &&
+				!AdmitSlotRead(heap, resolved.slot))
+			return false;
 		if (heap.IsMaterialized()) {
 			// Lock-free read: copy the dense slot under a seqlock identity
 			// bracket and accept the result only when the version is stable.
@@ -854,6 +954,8 @@ public:
 		if (!ResolveHeapSlot(cpuHandle, requiredType, &heapIndex, &slot))
 			return false;
 		DescriptorHeapRecord &heap = gDescriptorHeaps[heapIndex];
+		if (!AdmitSlotRead(heap, slot))
+			return false;
 		if (heap.IsMaterialized()) {
 			// Lock-free seqlock read (same protocol as ReadDescriptorFromSlot).
 			for (UINT attempt = 0; attempt < 4; ++attempt) {
@@ -913,7 +1015,8 @@ public:
 
 	static bool FindLatestDescriptor(
 		SIZE_T cpuHandle,
-		DescriptorRecord *outRecord)
+		DescriptorRecord *outRecord,
+		SlotReadIntent intent = SlotReadIntent::Consumer)
 	{
 		if (!cpuHandle || !outRecord) {
 			return false;
@@ -921,8 +1024,8 @@ public:
 
 		// Tier 1: try heap slot (per-heap shared lock)
 		DescriptorRecord temp;
-		if (ReadDescriptorFromSlot(cpuHandle,
-				D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES, &temp)) {
+		if (ReadDescriptorFromSlot(
+				cpuHandle, D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES, &temp, intent)) {
 			*outRecord = CloneDescriptorRecord(temp);
 			return true;
 		}

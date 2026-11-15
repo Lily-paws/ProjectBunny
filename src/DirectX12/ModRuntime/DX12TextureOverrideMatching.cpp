@@ -99,6 +99,34 @@ bool HasPotentialDescriptorTriggeredPrefilterCandidates(
 	return false;
 }
 
+// Decide, at view creation, whether a descriptor's value is mod-relevant: it
+// seeds the slot's `follow` gate bit. A false negative is safe but costly -
+// the value gets gated and a later read is refused - while a false positive
+// only forfeits a skipped copy. So follow everything when gating is off, all
+// mod-side writes, and everything a hash rule matches; when any rule can
+// trigger without a descriptor hash, no hash check can prove those rules
+// inert, so every view is followed.
+bool DX12CreateDescriptorFollowPredicate(uint32_t huntHash) noexcept
+{
+	if (EffectiveGateMode() == DescriptorGateMode::Off)
+		return true;
+	if (DX12DescriptorModWrite::InProgress())
+		return true;
+	const std::shared_ptr<const DX12CommandExecutionRuntimeSnapshot> &ref =
+		CommandExecutionRuntimeSnapshotTlsRef();
+	const DX12CommandExecutionRuntimeSnapshot *snapshot = ref.get();
+	if (!snapshot)
+		return false;
+	if (!snapshot->textureOverridesWithoutDrawContext.empty() ||
+		!snapshot->textureOverridesGenericDrawContext.empty() ||
+		!snapshot->textureOverridesByIndexCount.empty() ||
+		!snapshot->textureOverridesByVertexCount.empty())
+		return true;
+	return huntHash != 0 &&
+		snapshot->textureOverridesByHash.find(huntHash) !=
+			snapshot->textureOverridesByHash.end();
+}
+
 
 void CollectDescriptorTriggeredPrefilterSectionIds(
 	const DX12CommandExecutionRuntimeSnapshot &snapshot,

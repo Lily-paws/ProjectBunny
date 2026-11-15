@@ -54,6 +54,14 @@ bool DX12ModNeedsPreSkinningUavProbe();
 bool DX12ModNeedsPreSkinningBindingTracking();
 bool DX12ModNeedsCommandListSubmissionNotifications();
 void DX12ModRunPresentMaintenance();
+// Descriptor copy gating (v2.3): called once per presented frame from the
+// post-present funnel. Publishes the effective gate mode; on an epoch
+// boundary it also rotates the two pin generations on every live heap.
+void DX12DescriptorPinEpochTick(LONG presentCount);
+// F10 reload sweep: re-seeds descriptor gate `follow` bits on slots whose
+// records match the reloaded mod rules. Called after a successful reload;
+// never clears stale bits.
+void DX12RefreshDescriptorFollowCopiesOnIniReload();
 bool DX12ModMayNeedPreSkinIaViewExpansion(
 	const D3D12_VERTEX_BUFFER_VIEW *views, const bool *hasViews, UINT count);
 bool DX12ModShouldProbePreSkinningForCs(uint64_t computeShaderHash);

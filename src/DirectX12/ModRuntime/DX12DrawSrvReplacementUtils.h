@@ -1160,6 +1160,9 @@ return sightings;
 			if (!count) {
 				return false;
 			}
+			// The mod is about to read these slots at draw time; make sure the
+			// next copies into them are mirrored. Lock-free resolve, no memo.
+			DX12DescriptorHeapShadowUtils::PinTableSlots(tableCpuStart, type, count);
 			DX12DrawSrvPatchTable table;
 			table.compute = compute;
 			table.rootParameterIndex = root;

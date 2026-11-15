@@ -106,6 +106,10 @@ public:
 		DX12_PROF_ADD_US("Present.present_maintenance", DX12_DIAG_ELAPSED_US(sliceBegin));
 
 		DX12_DIAG_QPC_RESET(sliceBegin);
+		DX12DescriptorPinEpochTick(DX12RuntimeState::GetPresentCount());
+		DX12_PROF_ADD_US("Present.pin_epoch_tick", DX12_DIAG_ELAPSED_US(sliceBegin));
+
+		DX12_DIAG_QPC_RESET(sliceBegin);
 		DX12HuntOnPresent();
 		DX12_PROF_ADD_US("Present.hunt_on_present", DX12_DIAG_ELAPSED_US(sliceBegin));
 

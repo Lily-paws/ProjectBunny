@@ -236,7 +236,10 @@ private:
 		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
 		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srvDesc.Texture1D.MipLevels = 1;
-		device->CreateShaderResourceView(mTexture, &srvDesc, mSrvCpu);
+		{
+			DX12DescriptorModWrite::Guard modWriteGuard;
+			device->CreateShaderResourceView(mTexture, &srvDesc, mSrvCpu);
+		}
 
 		UINT64 totalBytes = 0;
 		device->GetCopyableFootprints(
@@ -619,7 +622,10 @@ public:
 		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srvDesc.Texture2D.MipLevels = 1;
-		mDevice->CreateShaderResourceView(mDefaultTexture, &srvDesc, mDefaultSrv);
+		{
+			DX12DescriptorModWrite::Guard modWriteGuard;
+			mDevice->CreateShaderResourceView(mDefaultTexture, &srvDesc, mDefaultSrv);
+		}
 
 		D3D12_DESCRIPTOR_HEAP_DESC desc = {};
 		desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -917,7 +923,10 @@ public:
 		rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
 		D3D12_CPU_DESCRIPTOR_HANDLE slot = mRtvCpuStart;
 		slot.ptr += static_cast<UINT64>(bufferIndex) * mRtvIncrement;
-		mDevice->CreateRenderTargetView(backBuffer, &rtvDesc, slot);
+		{
+			DX12DescriptorModWrite::Guard modWriteGuard;
+			mDevice->CreateRenderTargetView(backBuffer, &rtvDesc, slot);
+		}
 
 		// The resource stays referenced for as long as its view does. Without
 		// this the steady-state path would have to call GetBuffer on every

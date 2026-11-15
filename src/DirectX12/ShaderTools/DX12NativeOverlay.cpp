@@ -883,8 +883,11 @@ float4 PSMain(PSIn input) : SV_TARGET
 		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srvDesc.Texture2D.MipLevels = 1;
-		mDevice->CreateShaderResourceView(
-			mFontTexture, &srvDesc, mSrvHeap->GetCPUDescriptorHandleForHeapStart());
+		{
+			DX12DescriptorModWrite::Guard modWriteGuard;
+			mDevice->CreateShaderResourceView(
+				mFontTexture, &srvDesc, mSrvHeap->GetCPUDescriptorHandleForHeapStart());
+		}
 		mFontTextureReady = true;
 		mFontInitFailed = false;
 		DX12_LOG_FLUSH("DX12InGameTextOverlay",
