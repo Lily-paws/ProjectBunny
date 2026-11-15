@@ -12,7 +12,7 @@ name: Windows Build (ProjectBunny)
 
 on:
   push:
-    branches: ["main", "master"]
+    branches: ["main", "master", "dx12-copy-gating-v2.3"]
   pull_request:
   workflow_dispatch:
 
