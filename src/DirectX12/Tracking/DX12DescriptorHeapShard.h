@@ -329,9 +329,9 @@ public:
 		if (count == 0 || first >= maxSlots_)
 			return;
 		const uint32_t end = static_cast<uint32_t>(
-			std::min<uint64_t>(uint64_t(first) + count, maxSlots_));
+			(std::min<uint64_t>)(uint64_t(first) + count, maxSlots_));
 		for (uint32_t slot = first; slot < end; ) {
-			const uint32_t groupEnd = std::min(end, (slot | 63u) + 1);
+			const uint32_t groupEnd = (std::min)(end, (slot | 63u) + 1);
 			const uint32_t n = groupEnd - slot;
 			const uint64_t mask =
 				(n == 64 ? ~0ull : ((1ull << n) - 1)) << (slot & 63u);
