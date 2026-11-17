@@ -1215,6 +1215,31 @@ bool DX12ModCompileDrawDecision(
 	// descriptors, so the draw path can skip SRV binding resolution entirely.
 	decision->descriptorTargetsStatic =
 		DX12StaticTextureReplacementAllDescriptorOverridesStatic();
+	{
+		// Diagnostic: one line per compiled PSO decision (all matched PSOs, plus
+		// the first 400 others) so a log shows which vertex/pixel shader hashes the
+		// runtime sees and whether any ShaderOverride matched them.
+		static volatile LONG sShaderOverrideDiagCount = 0;
+		DX12PsoShaderInfo diagInfo = {};
+		const bool haveInfo = DX12GetPipelineStateShaderInfo(pipelineState, &diagInfo);
+		const bool interesting = shaderOverrides || shaderOverrideSkip;
+		if (interesting || InterlockedIncrement(&sShaderOverrideDiagCount) <= 400) {
+			DX12_LOG("DX12ShaderOverrideDiag",
+				"pso=%p haveInfo=%d hasVS=%d vs=%016llx hasPS=%d ps=%016llx "
+				"matched=%d skipDraw=%d kind=%d activeOverrides=%d gen=%llu",
+				pipelineState,
+				haveInfo ? 1 : 0,
+				diagInfo.hasVS ? 1 : 0,
+				static_cast<unsigned long long>(diagInfo.vs),
+				diagInfo.hasPS ? 1 : 0,
+				static_cast<unsigned long long>(diagInfo.ps),
+				shaderOverrides ? 1 : 0,
+				shaderOverrideSkip ? 1 : 0,
+				static_cast<int>(decision->kind),
+				activeShaderOverrides ? 1 : 0,
+				static_cast<unsigned long long>(reloadGeneration));
+		}
+	}
 	return true;
 }
 
