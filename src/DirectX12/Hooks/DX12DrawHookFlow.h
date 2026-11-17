@@ -115,6 +115,43 @@ public:
 			DX12FrameAnalysisState::CapturesDraws();
 		const DX12CompiledDrawDecision *residentDrawDecision = nullptr;
 
+		{
+			// DIAG: log draws on PSOs using the test VS hashes (first 60 per run).
+			static volatile LONG sDrawDiagCount = 0;
+			static thread_local ID3D12PipelineState *tlsPso = nullptr;
+			static thread_local bool tlsTarget = false;
+			static thread_local UINT64 tlsVs = 0;
+			ID3D12PipelineState *pso = runtimeState ? runtimeState->pipelineState : nullptr;
+			if (pso != tlsPso) {
+				tlsPso = pso;
+				tlsTarget = false;
+				tlsVs = 0;
+				DX12PsoShaderInfo di = {};
+				if (pso && DX12GetPipelineStateShaderInfo(pso, &di) && di.hasVS) {
+					tlsVs = di.vs;
+					tlsTarget = di.vs == 0x196b98ff6f5e8178ull ||
+						di.vs == 0xa92b1f6835795a98ull ||
+						di.vs == 0x000b531c83700304ull;
+				}
+			}
+			if (tlsTarget && InterlockedIncrement(&sDrawDiagCount) <= 60) {
+				DX12_LOG("DX12DrawHookDiag",
+					"pso=%p vs=%016llx flags=%016llx needsModWork=%d hunt=%d "
+					"capture=%d shaderOv=%d rs=%d decResolved=%d decKind=%d "
+					"decSkip=%d decGen=%llu curGen=%llu",
+					pso, (unsigned long long)tlsVs, (unsigned long long)flagsWord,
+					(int)needsModWork, (int)huntEnabled,
+					(int)frameCapturePendingOrActive,
+					(int)((flagsWord & DX12HotPathState::FLAG_SHADER_OVERRIDES) != 0),
+					(int)(runtimeState != nullptr),
+					runtimeState ? (int)runtimeState->drawDecision.resolved : -1,
+					runtimeState ? (int)runtimeState->drawDecision.kind : -1,
+					runtimeState ? (int)runtimeState->drawDecision.hasShaderOverrideSkip : -1,
+					runtimeState ? (unsigned long long)runtimeState->drawDecision.reloadGeneration : 0ull,
+					(unsigned long long)DX12ModGetReloadGenerationFast());
+			}
+		}
+
 		// DX11-style resident PSO rejection: when shader overrides are the only
 		// draw-driven feature for this PSO, a state proven unable to match must
 		// not enter the generic draw interpreter (counters, logging, IA keys, or
