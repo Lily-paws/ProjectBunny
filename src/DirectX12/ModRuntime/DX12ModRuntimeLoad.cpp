@@ -1427,6 +1427,9 @@ bool DX12ModRuntimeLoad(
 
 	DX12_LOCK_ACQUIRE_EXCLUSIVE(&gModLock, "Lock.modExclusive");
 	gShaderOverrides.swap(shaderOverrides);
+	for (const auto &kv : gShaderOverrides)
+		DX12_LOG("DX12ShaderOverrideKey", "hash=%016llx skip=%d",
+			(unsigned long long)kv.first, (int)kv.second.handlingSkip);
 	gShaderRegexes.swap(shaderRegexes);
 	gTextureOverrides.swap(textureOverrides);
 	gModResources.swap(resources);

@@ -1215,6 +1215,27 @@ bool DX12ModCompileDrawDecision(
 	// descriptors, so the draw path can skip SRV binding resolution entirely.
 	decision->descriptorTargetsStatic =
 		DX12StaticTextureReplacementAllDescriptorOverridesStatic();
+	{
+		DX12PsoShaderInfo diagInfo = {};
+		const bool haveInfo = DX12GetPipelineStateShaderInfo(pipelineState, &diagInfo);
+		const bool target =
+			haveInfo && (diagInfo.vs == 0xa92b1f6835795a98ull ||
+				diagInfo.vs == 0x000b531c83700304ull);
+		static volatile LONG sDiagAfterReload = 0;
+		if (shaderOverrides || shaderOverrideSkip || target ||
+				InterlockedIncrement(&sDiagAfterReload) <= 60) {
+			DX12_LOG("DX12ShaderOverrideDiag2",
+				"pso=%p hasVS=%d vs=%016llx hasPS=%d ps=%016llx "
+				"cfgs=%d shaderOverrides=%d skipDraw=%d kind=%d "
+				"metaHit=%d cached=%d gen=%llu",
+				pipelineState, haveInfo && diagInfo.hasVS,
+				(unsigned long long)diagInfo.vs, haveInfo && diagInfo.hasPS,
+				(unsigned long long)diagInfo.ps, (int)configs.size(),
+				(int)shaderOverrides, (int)shaderOverrideSkip,
+				(int)decision->kind, (int)compiledMetadataHit, (int)cached,
+				(unsigned long long)reloadGeneration);
+		}
+	}
 	return true;
 }
 
