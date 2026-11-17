@@ -542,6 +542,21 @@ public:
 		UINT dispatchGroupX = threadGroupCountX;
 		UINT dispatchGroupY = threadGroupCountY;
 		UINT dispatchGroupZ = threadGroupCountZ;
+		{
+			// DIAG: which pre-skin dispatch branch runs, with which group counts.
+			static volatile LONG sDispatchDiagCount = 0;
+			if (probe.applied && InterlockedIncrement(&sDispatchDiagCount) <= 80) {
+				DX12_LOG("DX12PreSkinDispatchDiag",
+					"cs=%016llx applied=1 handlingSkip=%d hasDispatch=%d "
+					"origGroups=%u,%u,%u overrideGroups=%u,%u,%u",
+					(unsigned long long)dispatchDecision->computeShaderHash,
+					(int)probe.dispatchOverride.handlingSkip,
+					(int)probe.dispatchOverride.hasDispatch,
+					threadGroupCountX, threadGroupCountY, threadGroupCountZ,
+					probe.dispatchOverride.groupsX, probe.dispatchOverride.groupsY,
+					probe.dispatchOverride.groupsZ);
+			}
+		}
 		if (probe.applied && probe.dispatchOverride.handlingSkip) {
 			if (probe.dispatchOverride.hasDispatch) {
 				dispatchGroupX = probe.dispatchOverride.groupsX;
