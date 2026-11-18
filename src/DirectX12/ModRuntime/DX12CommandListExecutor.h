@@ -1347,7 +1347,20 @@ public:
 		const Bunny::TextureOverrideConfig &config, int depth, bool includePost,
 		const DX12TextureOverrideMatch *thisMatch)
 	{
-		RunActions(config.actions, depth, includePost, thisMatch);
+		if (!config.hasCsHash) {
+			RunActions(config.actions, depth, includePost, thisMatch);
+			return;
+		}
+		// A pre-skin (cs_hash) section's dispatch= belongs to the compute
+		// pre-skin hook. Replaying it as a draw-time action would record a
+		// Dispatch while a graphics PSO is bound.
+		std::vector<Bunny::CommandListAction> actions;
+		actions.reserve(config.actions.size());
+		for (const Bunny::CommandListAction &action : config.actions) {
+			if (action.kind != Bunny::CommandListActionKind::Dispatch)
+				actions.push_back(action);
+		}
+		RunActions(actions, depth, includePost, thisMatch);
 	}
 
 	// Phase 3 capture mode: "ResourceX = ref ps-tN"/"ref vs-tN" executed at

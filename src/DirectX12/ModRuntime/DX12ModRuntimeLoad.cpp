@@ -2190,6 +2190,13 @@ void BuildDx12CompiledTextureOverridePlans(
 								&plan.mainActionPlan, commandPlan->second);
 							break;
 						}
+						case Bunny::CommandListActionKind::Dispatch:
+							// Pre-skin sections keep dispatch= for the compute hook only.
+							if (config.hasCsHash)
+								break;
+							if (!AppendActionToCompiledPlan(action, &plan.mainActionPlan))
+								plan.hasUnsupportedCommandActions = true;
+							break;
 						default:
 							if (!AppendActionToCompiledPlan(action, &plan.mainActionPlan))
 								plan.hasUnsupportedCommandActions = true;
