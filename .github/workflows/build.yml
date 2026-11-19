@@ -12,7 +12,7 @@ name: Windows Build (ProjectBunny)
 
 on:
   push:
-    branches: ["main", "master"]
+    branches: ["main", "master", "perf-pso-lookup-cache-upstream"]
   pull_request:
   workflow_dispatch:
 
