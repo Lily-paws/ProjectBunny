@@ -2,6 +2,12 @@
 // Split from DX12ModRuntime.cpp; implementation unit for its module.
 #include "DX12ModRuntimeInternal.h"
 
+// Bumped around every PSO record write; see PsoReplacementTlsEntry below. It is
+// declared here because the record writers that bump it precede the lookup.
+namespace {
+std::atomic<UINT64> gPsoRecordEpoch{ 1 };
+} // namespace
+
 
 void ReleaseStoredPso(DX12StoredPso *record)
 {
@@ -2083,7 +2089,6 @@ constexpr size_t kPsoReplacementTlsSlots = 256;
 static_assert((kPsoReplacementTlsSlots & (kPsoReplacementTlsSlots - 1)) == 0,
 	"PSO replacement TLS cache size must be a power of two");
 thread_local PsoReplacementTlsEntry tPsoReplacementTls[kPsoReplacementTlsSlots];
-std::atomic<UINT64> gPsoRecordEpoch{ 1 };
 
 inline size_t PsoReplacementTlsIndex(const ID3D12PipelineState *pso) noexcept
 {
