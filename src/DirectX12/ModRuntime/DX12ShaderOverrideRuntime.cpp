@@ -1946,7 +1946,9 @@ void DX12ModRecordGraphicsPipelineState(
 			&drawDirectTextureChecksOnly);
 	}
 
+	gPsoRecordEpoch.fetch_add(1, std::memory_order_release);
 	gPsoRecords[pipelineState] = std::move(record);
+	gPsoRecordEpoch.fetch_add(1, std::memory_order_release);
 	ReleaseSRWLockExclusive(&gModLock);
 }
 
@@ -1986,7 +1988,9 @@ void DX12ModRecordComputePipelineState(
 			nullptr);
 	}
 
+	gPsoRecordEpoch.fetch_add(1, std::memory_order_release);
 	gPsoRecords[pipelineState] = std::move(record);
+	gPsoRecordEpoch.fetch_add(1, std::memory_order_release);
 	ReleaseSRWLockExclusive(&gModLock);
 }
 
@@ -2059,10 +2063,65 @@ ID3D12PipelineState *CreateComputeReplacement(DX12StoredPso *record)
 }
 
 
+// Per-thread, direct-mapped front cache for DX12ModGetReplacementPipelineState.
+// The per-command-list cache in DX12CommandListStateCapture::PipelineState holds
+// one entry, so a list that alternates between PSOs misses on nearly every
+// SetPipelineState and each miss took gModLock (shared) plus an unordered_map
+// find. Only settled answers are stored here: a live replacement or a
+// confirmed "no replacement needed" for the current reload generation. Entries
+// are invalidated by the reload generation and by gPsoRecordEpoch, which is
+// bumped whenever a PSO record is (re)written, so a recycled PSO pointer can
+// never see a previous object's answer.
+namespace {
+struct PsoReplacementTlsEntry {
+	ID3D12PipelineState *key = nullptr;
+	ID3D12PipelineState *replacement = nullptr;
+	UINT64 generation = 0;
+	UINT64 epoch = 0;
+};
+constexpr size_t kPsoReplacementTlsSlots = 256;
+static_assert((kPsoReplacementTlsSlots & (kPsoReplacementTlsSlots - 1)) == 0,
+	"PSO replacement TLS cache size must be a power of two");
+thread_local PsoReplacementTlsEntry tPsoReplacementTls[kPsoReplacementTlsSlots];
+std::atomic<UINT64> gPsoRecordEpoch{ 1 };
+
+inline size_t PsoReplacementTlsIndex(const ID3D12PipelineState *pso) noexcept
+{
+	return (reinterpret_cast<uintptr_t>(pso) >> 4) &
+		(kPsoReplacementTlsSlots - 1);
+}
+
+inline void PsoReplacementTlsStore(
+	ID3D12PipelineState *pso,
+	ID3D12PipelineState *replacement,
+	UINT64 generation,
+	UINT64 epoch) noexcept
+{
+	PsoReplacementTlsEntry &entry =
+		tPsoReplacementTls[PsoReplacementTlsIndex(pso)];
+	entry.key = pso;
+	entry.replacement = replacement;
+	entry.generation = generation;
+	entry.epoch = epoch;
+}
+} // namespace
+
 ID3D12PipelineState *DX12ModGetReplacementPipelineState(ID3D12PipelineState *pipelineState)
 {
 	if (!pipelineState || !DX12ModHasActiveShaderOverrides())
 		return nullptr;
+
+	// Epoch first, then generation: a writer bumps the epoch around publishing a
+	// record, so a stale entry can only fail the comparison.
+	const UINT64 epoch = gPsoRecordEpoch.load(std::memory_order_acquire);
+	const UINT64 fastGeneration = gReloadGeneration;
+	{
+		const PsoReplacementTlsEntry &entry =
+			tPsoReplacementTls[PsoReplacementTlsIndex(pipelineState)];
+		if (entry.key == pipelineState && entry.generation == fastGeneration &&
+				entry.epoch == epoch)
+			return entry.replacement;
+	}
 
 	DX12StoredPso createRecord;
 	bool shouldCreate = false;
@@ -2079,10 +2138,12 @@ ID3D12PipelineState *DX12ModGetReplacementPipelineState(ID3D12PipelineState *pip
 	if (cached->second.replacement && cached->second.replacementGeneration == generation) {
 		ID3D12PipelineState *replacement = cached->second.replacement;
 		ReleaseSRWLockShared(&gModLock);
+		PsoReplacementTlsStore(pipelineState, replacement, generation, epoch);
 		return replacement;
 	}
 	if (cached->second.replacementNoopGeneration == generation) {
 		ReleaseSRWLockShared(&gModLock);
+		PsoReplacementTlsStore(pipelineState, nullptr, generation, epoch);
 		return nullptr;
 	}
 	ReleaseSRWLockShared(&gModLock);
@@ -2100,10 +2161,12 @@ ID3D12PipelineState *DX12ModGetReplacementPipelineState(ID3D12PipelineState *pip
 	if (record.replacement && record.replacementGeneration == generation) {
 		ID3D12PipelineState *replacement = record.replacement;
 		ReleaseSRWLockExclusive(&gModLock);
+		PsoReplacementTlsStore(pipelineState, replacement, generation, epoch);
 		return replacement;
 	}
 	if (record.replacementNoopGeneration == generation) {
 		ReleaseSRWLockExclusive(&gModLock);
+		PsoReplacementTlsStore(pipelineState, nullptr, generation, epoch);
 		return nullptr;
 	}
 
@@ -2119,6 +2182,7 @@ ID3D12PipelineState *DX12ModGetReplacementPipelineState(ID3D12PipelineState *pip
 	if (!needsReplacement) {
 		record.replacementNoopGeneration = generation;
 		ReleaseSRWLockExclusive(&gModLock);
+		PsoReplacementTlsStore(pipelineState, nullptr, generation, epoch);
 		return nullptr;
 	}
 	record.replacementNoopGeneration = 0;
@@ -2160,6 +2224,7 @@ ID3D12PipelineState *DX12ModGetReplacementPipelineState(ID3D12PipelineState *pip
 	it->second.replacement = newReplacement;
 	it->second.replacementGeneration = generation;
 	ReleaseSRWLockExclusive(&gModLock);
+	PsoReplacementTlsStore(pipelineState, newReplacement, generation, epoch);
 	return newReplacement;
 }
 
